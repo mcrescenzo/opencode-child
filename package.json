@@ -1,0 +1,43 @@
+{
+  "name": "@mcrescenzo/opencode-child",
+  "version": "0.1.0",
+  "description": "opencode plugin for starting, inspecting, and controlling disposable child opencode serve processes from a parent opencode session.",
+  "type": "module",
+  "main": "./opencode-child.js",
+  "exports": {
+    ".": "./opencode-child.js"
+  },
+  "files": [
+    "opencode-child.js",
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md"
+  ],
+  "license": "MIT",
+  "publishConfig": { "access": "public" },
+  "engines": { "node": ">=20.11.0" },
+  "author": "Michael Crescenzo",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mcrescenzo/opencode-child"
+  },
+  "bugs": {
+    "url": "https://github.com/mcrescenzo/opencode-child/issues"
+  },
+  "homepage": "https://github.com/mcrescenzo/opencode-child#readme",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "child"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "smoke": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.17.7"
+  }
+}
