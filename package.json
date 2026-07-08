@@ -1,6 +1,6 @@
 {
   "name": "@mcrescenzo/opencode-child",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "opencode plugin for starting, inspecting, and controlling disposable child opencode serve processes from a parent opencode session.",
   "type": "module",
   "main": "./opencode-child.js",
@@ -17,8 +17,12 @@
     "CODE_OF_CONDUCT.md"
   ],
   "license": "MIT",
-  "publishConfig": { "access": "public" },
-  "engines": { "node": ">=20.11.0" },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
   "author": "Michael Crescenzo",
   "repository": {
     "type": "git",
