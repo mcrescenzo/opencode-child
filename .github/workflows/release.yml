@@ -1,0 +1,86 @@
+name: release
+
+# Fully automatic npm releases via npm trusted publishing (OIDC).
+#
+# Trigger: any push to main that touches package.json. The job compares the
+# manifest version against the npm registry; if the version is already
+# published it exits green without side effects, so ordinary pushes are safe.
+# A version bump commit is the release intent: it publishes to npm (with
+# provenance), tags the commit vX.Y.Z, and creates a GitHub Release.
+#
+# Auth: no tokens. npmjs.com is configured to trust this exact workflow file
+# in this repository (package Settings -> Trusted Publisher). Requires the
+# id-token: write permission below and npm >= 11.5.1 on the runner.
+
+on:
+  push:
+    branches: [main]
+    paths: ["package.json"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the release tag + create the GitHub Release
+  id-token: write # OIDC token for npm trusted publishing + provenance
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Ensure npm supports trusted publishing (>= 11.5.1)
+        run: npm install -g npm@latest && npm --version
+
+      - name: Detect unpublished version
+        id: version
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$NAME@$VERSION is already on the registry - nothing to publish."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$NAME@$VERSION is unpublished - releasing."
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.version.outputs.publish == 'true'
+
+      - name: Install dependencies (repo-canonical package manager)
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          if [ -f bun.lock ]; then
+            bun install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Test
+        if: steps.version.outputs.publish == 'true'
+        run: node --test tests/*.test.mjs
+
+      - name: Publish to npm (trusted publishing; provenance is automatic)
+        if: steps.version.outputs.publish == 'true'
+        run: npm publish
+
+      - name: Tag and create GitHub Release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" --title "$TAG" --generate-notes
