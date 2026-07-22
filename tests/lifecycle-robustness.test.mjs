@@ -296,17 +296,19 @@ test("disposeLifecycleState is a no-op when no live process or event reader exis
 
 test("disposeLifecycleState bounds waiting for an exit handler that never settles", async () => {
   const proc = { pid: 2147483646 };
-  let resolveStuck;
-  const stuckPromise = new Promise((resolve) => { resolveStuck = resolve; });
+  // Use a promise that settles shortly after the disposal timeout so the
+  // background allSettled inside disposeLifecycleState can drain instead of
+  // dangling. The 10ms disposal timeout still wins the race; the 50ms
+  // settlement cleans up the floating promise chain before the file exits.
+  const slowPromise = new Promise((resolve) => setTimeout(resolve, 50));
   _test.liveProcesses.set("child_stuck_exit", proc);
-  _test.processExitCompletions.set(proc, stuckPromise);
+  _test.processExitCompletions.set(proc, slowPromise);
   try {
     const result = await disposeLifecycleState({ terminate: false, exitHandlerTimeoutMs: 10 });
     assert.deepEqual(result.exitHandlers, { timedOut: true, count: 1, timeoutMs: 10 });
+    // Wait for the slow promise to settle so no promise is left dangling.
+    await slowPromise;
   } finally {
-    // Resolve the stuck promise so the background allSettled inside
-    // disposeLifecycleState can settle instead of dangling forever.
-    resolveStuck();
     _test.liveProcesses.delete("child_stuck_exit");
     _test.processExitCompletions.delete(proc);
   }
