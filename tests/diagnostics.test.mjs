@@ -80,6 +80,9 @@ test("diagnostic text truncation does not split a surrogate pair at the MAX_STRI
   assert.equal(redacted.includes("�"), false);
   assert.equal(typeof redacted.isWellFormed === "function" ? redacted.isWellFormed() : true, true);
   assert.match(redacted, /\n\[truncated \d+ chars\]$/);
+  // The suffix must report the exact number of UTF-16 code units excluded by the
+  // adjusted endpoint (end=3999 backs off the lone high surrogate), not MAX_STRING.
+  assert.match(redacted, /\n\[truncated 2 chars\]$/);
 });
 
 test("emoji crossing the truncation boundary survives a JSONL writeFile/readFile round trip", async () => {

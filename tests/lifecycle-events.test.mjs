@@ -260,6 +260,46 @@ test("startEventTail redacts malformed and oversized event data before storing",
   });
 });
 
+test("startEventTail discards oversized frames with an error marker and resumes after the block boundary", async () => {
+  await withScriptedServer(async (req, res) => {
+    if (req.url !== "/global/event") {
+      res.statusCode = 404;
+      res.end("missing");
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    // Write an oversized data line (> EVENT_BUFFER_LIMIT) without terminating it,
+    // so the unterminated tail exceeds the buffer limit before the boundary arrives.
+    const huge = "X".repeat(70000);
+    res.write(`data: ${huge}`);
+    await delay(50);
+    // Terminate the oversized frame and immediately follow with a valid frame.
+    res.write(`\n\nid: 0\nevent: session.update\ndata: {"ok":true}\n\n`);
+    res.end();
+  }, async (baseUrl) => {
+    const fixture = eventTailFixture(baseUrl);
+    startEventTail(fixture.registry, fixture.child, undefined, {
+      ...fixture.options,
+      initialBackoffMs: 1000,
+      persistDebounceMs: 5,
+      persistEvery: 100,
+    });
+
+    try {
+      await waitUntil(() => fixture.child.events.length >= 2, "expected an error marker and a valid frame");
+      const errorEvent = fixture.child.events.find((e) => e.type === "event.error");
+      assert.ok(errorEvent, "expected an oversized-frame error marker");
+      assert.match(errorEvent.error, /frame exceeded buffer limit/);
+      const validEvent = fixture.child.events.find((e) => e.type === "session.update");
+      assert.ok(validEvent, "expected the valid frame after the oversized one to be parsed");
+      assert.equal(validEvent.data.ok, true);
+    } finally {
+      fixture.stop();
+      await delay(20);
+    }
+  });
+});
+
 test("startEventTail caps stored events and coalesces registry writes", async () => {
   await withSseServer(205, async (baseUrl) => {
     const fixture = eventTailFixture(baseUrl);

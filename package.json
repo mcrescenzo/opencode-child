@@ -1,6 +1,6 @@
 {
   "name": "@mcrescenzo/opencode-child",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "opencode plugin for starting, inspecting, and controlling disposable child opencode serve processes from a parent opencode session.",
   "type": "module",
   "main": "./opencode-child.js",

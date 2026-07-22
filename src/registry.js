@@ -247,6 +247,24 @@ export class ChildRegistry {
     });
   }
 
+  async conditionalPatch(id, expectedNonce, fields, options = {}) {
+    return await this.transact(async (next) => {
+      const current = next.get(id);
+      if (!current) return { applied: false, child: undefined };
+      if (expectedNonce && current.nonce && expectedNonce !== current.nonce) {
+        return { applied: false, child: current };
+      }
+      const terminal = current.expectedStop || TERMINAL_STATUSES.has(current.status);
+      const allowedTerminalStatuses = new Set(options.allowedTerminalStatuses || []);
+      if (terminal && !allowedTerminalStatuses.has(current.status)) {
+        return { applied: false, child: current };
+      }
+      const updated = { ...current, ...fields, updatedAt: nowIso() };
+      next.set(id, updated);
+      return { applied: true, child: updated };
+    });
+  }
+
   // Evict terminal (stopped/exited/failed/stopping) rows from the given map so it
   // does not grow without bound: drop the oldest rows past maxTerminal and any
   // terminal row whose stoppedAt/updatedAt is older than maxAgeMs. Mutates the map

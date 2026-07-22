@@ -294,6 +294,19 @@ test("disposeLifecycleState is a no-op when no live process or event reader exis
   assert.equal(result.termination, undefined);
 });
 
+test("disposeLifecycleState bounds waiting for an exit handler that never settles", async () => {
+  const proc = { pid: 2147483646 };
+  _test.liveProcesses.set("child_stuck_exit", proc);
+  _test.processExitCompletions.set(proc, new Promise(() => {}));
+  try {
+    const result = await disposeLifecycleState({ terminate: false, exitHandlerTimeoutMs: 10 });
+    assert.deepEqual(result.exitHandlers, { timedOut: true, count: 1, timeoutMs: 10 });
+  } finally {
+    _test.liveProcesses.delete("child_stuck_exit");
+    _test.processExitCompletions.delete(proc);
+  }
+});
+
 test("getLiveProcess returns the tracked live process for a child id", () => {
   const id = "child_live_lookup";
   const proc = { pid: 123456 };
@@ -414,6 +427,68 @@ test("exit handler updates state when this proc still owns the id", async () => 
   } finally {
     _test.liveProcesses.delete(key);
     _test.eventReaders.delete(key);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("expected-stop exit handling remains notification-suppressed during disposal", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "oc-exit-expected-dispose-"));
+  const id = "child_expected_dispose";
+  const registry = new ChildRegistry(dir);
+  const key = _test.lifecycleKey(registry, id);
+  let notifications = 0;
+  try {
+    await registry.upsert({ id, nonce: "N1", status: "stopping", expectedStop: true, pid: 2147483646, baseUrl: "http://127.0.0.1:9" });
+    const proc = new (await import("node:events")).EventEmitter();
+    proc.pid = 2147483646;
+    const child = { id, nonce: "N1", registered: true, expectedStop: true, logs: { stdout: "", stderr: "" } };
+    _test.liveProcesses.set(key, proc);
+    _test.trackProcessExit(proc, (code, signal) => _test.handleProcExit({
+      id, proc, child, code, signal, registry,
+      notifier: { async handleChildExit() { notifications += 1; } },
+    }));
+    const disposing = disposeLifecycleState({ terminate: false, exitHandlerTimeoutMs: 500 });
+    proc.emit("exit", 0, null);
+    const result = await disposing;
+    assert.equal(result.exitHandlers.timedOut, false);
+    assert.equal(notifications, 0);
+    assert.equal((await registry.get(id)).status, "stopped");
+  } finally {
+    _test.liveProcesses.delete(key);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a delayed exit patch cannot overwrite stop metadata or a replacement row", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "oc-exit-delayed-patch-"));
+  const id = "child_delayed_patch";
+  const registry = new ChildRegistry(dir);
+  const writer = new ChildRegistry(dir);
+  let releasePatch;
+  let patchEntered;
+  const entered = new Promise((resolve) => { patchEntered = resolve; });
+  const originalPatch = registry.conditionalPatch.bind(registry);
+  registry.conditionalPatch = async (...args) => {
+    patchEntered();
+    await new Promise((resolve) => { releasePatch = resolve; });
+    return await originalPatch(...args);
+  };
+  try {
+    await registry.upsert({ id, nonce: "OLD", status: "ready", pid: 1, baseUrl: "http://127.0.0.1:9" });
+    const child = { id, nonce: "OLD", registered: true, logs: { stdout: "old", stderr: "" } };
+    const exiting = _test.handleProcExit({ id, proc: { pid: 1 }, child, code: 1, signal: null, registry });
+    await entered;
+    await writer.markStopped(id, { marker: "fresh-stop" });
+    await writer.insert({ id, nonce: "NEW", status: "ready", pid: 2, baseUrl: "http://127.0.0.1:10", marker: "replacement" }, { allowExistingTerminal: true });
+    releasePatch();
+    await exiting;
+
+    const current = await writer.get(id);
+    assert.equal(current.nonce, "NEW");
+    assert.equal(current.status, "ready");
+    assert.equal(current.marker, "replacement");
+  } finally {
+    releasePatch?.();
     await rm(dir, { recursive: true, force: true });
   }
 });

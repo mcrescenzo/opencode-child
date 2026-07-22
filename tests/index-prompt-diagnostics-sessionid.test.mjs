@@ -98,3 +98,27 @@ test("oc_prompt with an explicit sessionId records that sessionId in diagnostics
     });
   });
 });
+
+test("failed oc_prompt preserves an explicit sessionId in diagnostics", async () => {
+  await withDiagnosticsRoot(async (diagRoot) => {
+    await withPluginContext(async ({ plugin, context }) => {
+      await assert.rejects(
+        () => plugin.tool.oc_prompt.execute({
+          childId: "child_missing_for_prompt",
+          sessionId: "ses_explicit_failure",
+          text: "hello",
+        }, context),
+        /unknown child: child_missing_for_prompt/,
+      );
+
+      const prompts = (await diagnosticLines(diagRoot))
+        .map((line) => JSON.parse(line))
+        .filter((record) => record.tool === "oc_prompt");
+      assert.equal(prompts.length, 1, JSON.stringify(prompts));
+      assert.equal(prompts[0].event, "child_prompt_failed");
+      assert.equal(prompts[0].outcome, "failure");
+      assert.equal(prompts[0].childID, "child_missing_for_prompt");
+      assert.equal(prompts[0].sessionID, "ses_explicit_failure");
+    });
+  });
+});

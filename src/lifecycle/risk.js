@@ -1,4 +1,5 @@
 import path from "node:path";
+import net from "node:net";
 import { isLoopbackHostname, isSecretKey } from "../util.js";
 
 function hasEntries(value) {
@@ -253,6 +254,11 @@ function assertHighRiskApproval(args, trustMode, hostname) {
 export function validateStartPreflight(args = {}, values = {}) {
   const trustMode = values.trustMode || args.trustMode || "inherit";
   const hostname = values.hostname || args.hostname || "127.0.0.1";
+  // Reject malformed dotted-numeric hostnames before they reach spawn or approval
+  // as ordinary hostnames (e.g. 127.0.0.999 is not a valid IPv4 literal).
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname) && net.isIP(hostname) === 0) {
+    throw new Error(`invalid IPv4 hostname: ${hostname}`);
+  }
   if (isMetadataServiceHostname(hostname)) {
     throw new Error("metadata-service and link-local child hostnames are not supported");
   }

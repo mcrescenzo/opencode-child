@@ -207,6 +207,17 @@ test("isLoopbackHostname rejects public bind addresses", () => {
   assert.equal(isLoopbackHostname("0.0.0.0"), false);
 });
 
+test("isLoopbackHostname rejects malformed numeric octets that are not valid IPv4", () => {
+  assert.equal(isLoopbackHostname("127.0.0.999"), false);
+  assert.equal(isLoopbackHostname("127.999.999.999"), false);
+  assert.equal(isLoopbackHostname("127.0.0.1.2"), false);
+  assert.equal(isLoopbackHostname("127.0.0"), false);
+  assert.equal(isLoopbackHostname("127.0.0.256"), false);
+  // valid 127/8 addresses are still accepted
+  assert.equal(isLoopbackHostname("127.255.255.254"), true);
+  assert.equal(isLoopbackHostname("127.0.0.1"), true);
+});
+
 test("modelFromParts returns object for a complete pair", () => {
   assert.deepEqual(modelFromParts("openai", "gpt-5.5"), { providerID: "openai", modelID: "gpt-5.5" });
 });

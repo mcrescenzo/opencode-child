@@ -18,10 +18,13 @@ const SIGNAL_EXIT_WATCHDOG_MS = 5000;
 const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 };
 const LOG_LIMIT = 12000;
 const TCP_LISTEN_STATE = "0A";
+const PUBLIC_ERROR_TEXT_LIMIT = 1000;
 
 const liveProcesses = new Map();
 const eventReaders = new Map();
 const lifecycleQueues = new Map();
+const startupQueues = new Map();
+const processExitCompletions = new Map();
 const signalExitWatchdogs = new Map();
 
 // Namespace every lifecycle-map key by the registry's state dir. Child-id
@@ -97,12 +100,17 @@ export function resolveStartupTimeout(rawTimeoutMs) {
   return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TOOL_TIMEOUT_MS) : DEFAULT_STARTUP_TIMEOUT_MS;
 }
 
-let startQueue = Promise.resolve();
-
 async function enqueueStart(registry, args = {}, context = {}, notifier) {
-  const run = startQueue.then(() => startChildUnlocked(registry, args, context, notifier), () => startChildUnlocked(registry, args, context, notifier));
-  startQueue = run.catch(() => {});
-  return await run;
+  const key = registry.stateDir;
+  const previous = startupQueues.get(key) || Promise.resolve();
+  const run = previous.then(() => startChildUnlocked(registry, args, context, notifier), () => startChildUnlocked(registry, args, context, notifier));
+  const tracked = run.catch(() => {});
+  startupQueues.set(key, tracked);
+  try {
+    return await run;
+  } finally {
+    if (startupQueues.get(key) === tracked) startupQueues.delete(key);
+  }
 }
 
 // SIGTERM every process group, wait a bounded grace window (polling liveness),
@@ -217,6 +225,8 @@ function sanitizedRestartSpec(args, values) {
     allowUnknownConfigKeys: Boolean(args.allowUnknownConfigKeys),
     allowUnsafeEnvOverrides: Boolean(args.allowUnsafeEnvOverrides),
     allowUnsafeConfigPermissions: Boolean(args.allowUnsafeConfigPermissions),
+    hadCustomConfig: Boolean(args.config && Object.keys(args.config).length),
+    hadCustomEnv: Boolean(args.env && Object.keys(args.env).length),
   };
   if (args.opencodeBin) spec.opencodeBin = args.opencodeBin;
   return spec;
@@ -237,13 +247,30 @@ function restartRiskApprovals(spec) {
 }
 
 function buildRestartSpec(old, args = {}) {
+  const saved = old.spec || {};
+  const hadCustomConfig = Boolean(saved.hadCustomConfig || saved.config !== undefined);
+  const hadCustomEnv = Boolean(saved.hadCustomEnv || saved.env !== undefined);
   const spec = {
-    ...(old.spec || {}), ...args,
+    projectDir: saved.projectDir || old.projectDir,
+    hostname: saved.hostname || old.hostname,
+    trustMode: saved.trustMode || old.trustMode,
+    pure: Boolean(saved.pure),
+    dangerouslySkipPermissions: Boolean(saved.dangerouslySkipPermissions),
+    allowNonLoopback: Boolean(saved.allowNonLoopback),
+    allowUnsafeSafeOverrides: Boolean(saved.allowUnsafeSafeOverrides),
+    allowUnknownConfigKeys: Boolean(saved.allowUnknownConfigKeys),
+    allowUnsafeEnvOverrides: Boolean(saved.allowUnsafeEnvOverrides),
+    allowUnsafeConfigPermissions: Boolean(saved.allowUnsafeConfigPermissions),
+    ...(saved.opencodeBin ? { opencodeBin: saved.opencodeBin } : {}),
+    ...args,
     id: args.id || old.id,
     port: args.port || old.port,
     configDir: old.configDir,
     dataDir: old.dataDir, cacheDir: old.cacheDir, xdgStateDir: old.xdgStateDir,
     inheritData: old.inheritData, managedDirs: old.managedDirs || [], cleanupPolicy: old.cleanupPolicy,
+    config: args.config ?? {},
+    env: args.env ?? {},
+    _restartDropped: [hadCustomConfig ? "custom config" : undefined, hadCustomEnv ? "custom environment overrides" : undefined].filter(Boolean),
     _allowExistingId: true,
   };
   delete spec.pid;
@@ -467,8 +494,7 @@ async function handleProcExit({ id, proc, child, code, signal, registry, notifie
   if (current && child.nonce && current.nonce && current.nonce !== child.nonce) return;
   const expectedStop = child.expectedStop || current?.expectedStop || current?.status === "stopping" || current?.status === "stopped";
   child.status = expectedStop ? "stopped" : "exited";
-  const updated = {
-    ...(current || child),
+  const lifecycleFields = {
     logs: child.logs,
     events: child.events ?? current?.events,
     exit,
@@ -476,8 +502,24 @@ async function handleProcExit({ id, proc, child, code, signal, registry, notifie
     status: child.status,
     ...(expectedStop ? { expectedStop: true, stoppedAt: current?.stoppedAt ?? exit.at } : {}),
   };
-  await registry.upsert(updated).catch(() => {});
-  if (!expectedStop) await notifier?.handleChildExit(updated, exit).catch(() => {});
+  const patch = await registry.conditionalPatch(id, child.nonce, lifecycleFields, {
+    allowedTerminalStatuses: expectedStop ? ["stopping"] : [],
+  }).catch(() => undefined);
+  if (!patch?.applied) return;
+  if (!expectedStop) await notifier?.handleChildExit(patch.child, exit).catch(() => {});
+}
+
+function trackProcessExit(proc, handler) {
+  let resolveCompletion;
+  const completion = new Promise((resolve) => { resolveCompletion = resolve; });
+  processExitCompletions.set(proc, completion);
+  proc.on("exit", (code, signal) => {
+    Promise.resolve(handler(code, signal)).catch(() => {}).finally(() => {
+      resolveCompletion();
+      if (processExitCompletions.get(proc) === completion) processExitCompletions.delete(proc);
+    });
+  });
+  return completion;
 }
 
 export async function startChild(registry, args = {}, context = {}, notifier) {
@@ -485,7 +527,7 @@ export async function startChild(registry, args = {}, context = {}, notifier) {
   return await enqueueStart(registry, args, context, notifier);
 }
 
-async function createManagedDirs(requests, managedDirs, newManagedDirs) {
+async function createManagedDirs(requests, managedDirs, newManagedDirs, cleanup = cleanupManagedDirs) {
   const results = await Promise.allSettled(requests.map(async ({ key, prefix }) => {
     return { key, dir: await mkdtemp(path.join(tmpdir(), prefix)) };
   }));
@@ -496,8 +538,7 @@ async function createManagedDirs(requests, managedDirs, newManagedDirs) {
   }
   const failed = results.find((result) => result.status === "rejected");
   if (failed) {
-    await cleanupManagedDirs(created.map(({ dir }) => dir));
-    throw failed.reason;
+    throw await cleanupWithDiagnostics(created.map(({ dir }) => dir), failed.reason, cleanup);
   }
   return Object.fromEntries(created.map(({ key, dir }) => [key, dir]));
 }
@@ -507,6 +548,38 @@ async function cleanupManagedDirs(dirs, options = {}) {
   if (!targets.length) return [];
   const sandboxRoots = await resolveSandboxRoots(options.extraRoots || []);
   return await Promise.all(targets.map((dir) => safeRmDir(dir, { ...options, sandboxRoots })));
+}
+
+function boundedPublicText(value, max = PUBLIC_ERROR_TEXT_LIMIT) {
+  const text = scrubSecrets(String(value ?? ""));
+  if (text.length <= max) return text;
+  let end = max;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return text.slice(0, end);
+}
+
+function publicCleanupReason(reason) {
+  return boundedPublicText(reason || "unknown cleanup failure", 200)
+    .replace(/(?:[A-Za-z]:)?[/\\][^\s,;:)]+/g, "[path]");
+}
+
+async function cleanupWithDiagnostics(dirs, originalError, cleanup = cleanupManagedDirs) {
+  let results;
+  try {
+    results = await cleanup(dirs);
+  } catch (cleanupError) {
+    results = [{ deleted: false, reason: cleanupError?.message || String(cleanupError) }];
+  }
+  const failures = (results || []).filter((result) => result?.deleted === false);
+  if (!failures.length) return originalError;
+  const reasons = [...new Set(failures.map((result) => publicCleanupReason(result.reason)))];
+  const originalMessage = boundedPublicText(originalError?.message || String(originalError), 2800);
+  const detail = boundedPublicText(reasons.join("; "), 900);
+  const wrapped = new Error(boundedPublicText(`${originalMessage}; cleanup incomplete: ${failures.length} directories could not be removed (${detail})`, 4000), { cause: originalError });
+  wrapped.name = originalError?.name || "Error";
+  if (typeof originalError?.code === "string" || typeof originalError?.code === "number") wrapped.code = originalError.code;
+  return wrapped;
 }
 
 // Default cleanup posture keys off whether THIS start actually auto-created managed
@@ -519,7 +592,7 @@ function resolveCleanupPolicy(explicit, newManagedDirs) {
   return (newManagedDirs && newManagedDirs.length) ? "delete-on-stop" : "keep";
 }
 
-async function provisionStartValues(args, context) {
+async function provisionStartValues(args, context, options = {}) {
   const projectDir = path.resolve(args.projectDir || context.directory || process.cwd());
   const managedDirs = Array.isArray(args.managedDirs) ? [...args.managedDirs] : [];
   const newManagedDirs = [];
@@ -532,23 +605,27 @@ async function provisionStartValues(args, context) {
     if (!args.cacheDir) requests.push({ key: "cacheDir", prefix: "opencode-child-cache-" });
     if (!args.xdgStateDir) requests.push({ key: "xdgStateDir", prefix: "opencode-child-state-" });
   }
-  const created = await createManagedDirs(requests, managedDirs, newManagedDirs);
+  const created = await createManagedDirs(requests, managedDirs, newManagedDirs, options.cleanupManagedDirs || cleanupManagedDirs);
   const configDir = path.resolve(args.configDir || created.configDir);
   const dataDir = inheritData ? undefined : path.resolve(args.dataDir || created.dataDir);
   const cacheDir = inheritData ? undefined : path.resolve(args.cacheDir || created.cacheDir);
   const xdgStateDir = inheritData ? undefined : path.resolve(args.xdgStateDir || created.xdgStateDir);
 
-  return {
-    projectDir,
-    managedDirs,
-    newManagedDirs,
-    configDir,
-    inheritData,
-    dataDir,
-    cacheDir,
-    xdgStateDir,
-    port: args.port || await freePort(),
-  };
+  try {
+    return {
+      projectDir,
+      managedDirs,
+      newManagedDirs,
+      configDir,
+      inheritData,
+      dataDir,
+      cacheDir,
+      xdgStateDir,
+      port: args.port || await (options.allocatePort || freePort)(),
+    };
+  } catch (error) {
+    throw await cleanupWithDiagnostics(newManagedDirs, error, options.cleanupManagedDirs || cleanupManagedDirs);
+  }
 }
 
 async function inspectReadyChild(child, proc, client, startupTimeoutMs, signal) {
@@ -588,19 +665,18 @@ async function startChildUnlocked(registry, args = {}, context = {}, notifier) {
     throw new Error(`opencode-child concurrency cap reached: ${liveCount}/${maxLive} live children. Stop some via oc_child_stop, or raise maxConcurrent / OPENCODE_CHILD_MAX_LIVE.`);
   }
 
-  const { projectDir, managedDirs, newManagedDirs, configDir, inheritData, dataDir, cacheDir, xdgStateDir, port } = await provisionStartValues(effectiveArgs, context);
+  const cleanupFailedStart = effectiveArgs._cleanupManagedDirs || cleanupManagedDirs;
+  const { projectDir, managedDirs, newManagedDirs, configDir, inheritData, dataDir, cacheDir, xdgStateDir, port } = await provisionStartValues(effectiveArgs, context, { cleanupManagedDirs: cleanupFailedStart });
   const baseUrl = `http://${hostname}:${port}`;
   const opencodeBin = effectiveOpencodeBin(effectiveArgs) || "opencode";
   const startupTimeoutMs = resolveStartupTimeout(effectiveArgs.timeoutMs);
   const cleanupPolicy = resolveCleanupPolicy(effectiveArgs.cleanupPolicy, newManagedDirs);
 
-  await validateStartArgs(registry, effectiveArgs, { id, trustMode, hostname, managedDirs, projectDir, configDir, dataDir, cacheDir, xdgStateDir, inheritData, port, cleanupPolicy }, { terminalStatuses: TERMINAL_STATUSES });
-
   try {
+    await validateStartArgs(registry, effectiveArgs, { id, trustMode, hostname, managedDirs, projectDir, configDir, dataDir, cacheDir, xdgStateDir, inheritData, port, cleanupPolicy }, { terminalStatuses: TERMINAL_STATUSES });
     await writeChildConfig(configDir, effectiveArgs.config || {}, trustMode);
   } catch (error) {
-    await cleanupManagedDirs(newManagedDirs);
-    throw error;
+    throw await cleanupWithDiagnostics(newManagedDirs, error, cleanupFailedStart);
   }
 
   const env = safeEnv(trustMode, effectiveArgs.env || {}, effectiveArgs.inheritEnv ?? trustMode !== "safe");
@@ -671,6 +747,9 @@ async function startChildUnlocked(registry, args = {}, context = {}, notifier) {
     },
     logs: { stdout: "", stderr: "" },
   };
+  if (effectiveArgs._restartDropped?.length) {
+    appendLog(child, "stderr", `\n[restart non-fidelity] intentionally dropped prior ${effectiveArgs._restartDropped.join(" and ")}; supply new values explicitly\n`);
+  }
   notifier?.clearExpectedStop(child.id);
   notifier?.registerChildOwner(child.id, context);
   if (proc.pid) liveProcesses.set(key, proc);
@@ -678,7 +757,7 @@ async function startChildUnlocked(registry, args = {}, context = {}, notifier) {
   proc.stdout.on("data", (chunk) => appendLog(child, "stdout", chunk));
   proc.stderr.on("data", (chunk) => appendLog(child, "stderr", chunk));
   proc.on("error", (error) => appendLog(child, "stderr", `\n[spawn error] ${error.message}\n`));
-  proc.on("exit", (code, signal) => { handleProcExit({ id, proc, child, code, signal, registry, notifier }).catch(() => {}); });
+  trackProcessExit(proc, (code, signal) => handleProcExit({ id, proc, child, code, signal, registry, notifier }));
   try {
     await registry.insert(child, { allowExistingTerminal: Boolean(effectiveArgs._allowExistingId) });
     child.registered = true;
@@ -688,8 +767,7 @@ async function startChildUnlocked(registry, args = {}, context = {}, notifier) {
     if (proc.pid) signalProcessGroup(proc.pid, "SIGTERM");
     await sleep(200);
     if (proc.pid && isPidAlive(proc.pid)) signalProcessGroup(proc.pid, "SIGKILL");
-    await cleanupManagedDirs(newManagedDirs);
-    throw error;
+    throw await cleanupWithDiagnostics(newManagedDirs, error, cleanupFailedStart);
   }
 
   const client = new ChildHttpClient(baseUrl, { ...auth, timeoutMs: startupTimeoutMs });
@@ -719,16 +797,18 @@ async function startChildUnlocked(registry, args = {}, context = {}, notifier) {
     startupController.abort();
     child.status = "failed";
     child.error = spawnError?.message || error.message;
+    const attempt = effectiveArgs._portAttempt || 0;
+    const stderr = child.logs?.stderr || "";
+    const retryablePortFailure = !effectiveArgs.port && attempt < 2 && /EADDRINUSE|address already in use/i.test(`${stderr} ${error.message}`);
     // Guard the failure-state write so a transient registry error cannot skip the
     // stopChild cleanup below, which would otherwise leak the spawned process group.
     await registry.upsertIfCurrentActive(child).catch(() => {});
-    await stopChildUnlocked(registry, await registry.get(id).catch(() => child), { cleanup: true, includeStale: true, allowRegistryPidSignal: true }, notifier).catch(() => {});
+    await stopChildUnlocked(registry, await registry.get(id).catch(() => child), { cleanup: !retryablePortFailure, includeStale: true, allowRegistryPidSignal: true }, notifier).catch(() => {});
     // Bounded retry on a lost-port race (freePort is TOCTOU): only when the caller did
     // not pin an explicit port. Clean this attempt's managed temp dirs, pick a fresh port.
-    const attempt = effectiveArgs._portAttempt || 0;
-    const stderr = child.logs?.stderr || "";
-    if (!effectiveArgs.port && attempt < 2 && /EADDRINUSE|address already in use/i.test(`${stderr} ${error.message}`)) {
-      await cleanupManagedDirs(newManagedDirs);
+    if (retryablePortFailure) {
+      const cleanupError = await cleanupWithDiagnostics(newManagedDirs, error, cleanupFailedStart);
+      if (cleanupError !== error) throw cleanupError;
       return startChildUnlocked(registry, { ...effectiveArgs, id, _portAttempt: attempt + 1, _allowExistingId: true }, context, notifier);
     }
     throw error;
@@ -760,8 +840,52 @@ export async function stopChild(registry, id, options = {}, notifier) {
     return await withChildLifecycle(lifecycleKey(registry, id), async () => stopChildUnlocked(registry, await registry.get(id), options, notifier));
   }
   const targets = await registry.list();
-  return await Promise.all(targets.map((target) =>
+  const settled = await Promise.allSettled(targets.map((target) =>
     withChildLifecycle(lifecycleKey(registry, target.id), async () => stopChildUnlocked(registry, await registry.get(target.id).catch(() => target), options, notifier))));
+  if (!options.signal?.aborted && settled.every((outcome) => outcome.status === "fulfilled")) return settled.map((outcome) => outcome.value);
+  const outcomes = settled.map((outcome, index) => outcome.status === "fulfilled"
+    ? { childId: targets[index].id, status: "fulfilled", result: publicStopResult(outcome.value) }
+    : { childId: targets[index].id, status: "rejected", error: publicStopError(outcome.reason) });
+  throw new BulkStopError(outcomes, { cancelled: Boolean(options.signal?.aborted) });
+}
+
+function publicStopResult(result = {}) {
+  const output = {};
+  for (const key of ["id", "stopped", "skipped", "processAlive", "stopOutcome", "terminated", "killed"]) {
+    if (result[key] !== undefined) output[key] = result[key];
+  }
+  if (result.reason !== undefined) output.reason = boundedPublicText(result.reason);
+  if (result.dispose !== undefined) {
+    output.dispose = {
+      ok: result.dispose?.ok,
+      status: result.dispose?.status,
+      ...(result.dispose?.error === undefined ? {} : { error: boundedPublicText(result.dispose.error) }),
+    };
+  }
+  return output;
+}
+
+function publicStopError(error) {
+  return {
+    name: boundedPublicText(error?.name || error?.constructor?.name || "Error", 200),
+    ...((typeof error?.code === "string" || typeof error?.code === "number") ? { code: error.code } : {}),
+    message: boundedPublicText(error?.message || String(error)),
+  };
+}
+
+export class BulkStopError extends Error {
+  constructor(outcomes, { cancelled = false } = {}) {
+    const rejected = outcomes.filter((outcome) => outcome.status === "rejected").length;
+    const code = cancelled ? "OPENCODE_CHILD_BULK_STOP_CANCELLED" : "OPENCODE_CHILD_BULK_STOP_FAILED";
+    super(boundedPublicText(cancelled
+      ? `Bulk stop cancelled after all ${outcomes.length} targets settled`
+      : `Bulk stop failed for ${rejected} of ${outcomes.length} targets`, 4000));
+    this.name = "BulkStopError";
+    this.code = code;
+    this.cancelled = cancelled;
+    this.summary = { total: outcomes.length, fulfilled: outcomes.length - rejected, rejected };
+    this.outcomes = outcomes;
+  }
 }
 
 async function stopChildUnlocked(registry, child, options = {}, notifier) {
@@ -777,7 +901,7 @@ async function stopChildUnlocked(registry, child, options = {}, notifier) {
   child.expectedStop = true;
   notifier?.markExpectedStop(child.id);
   if (live) child.status = "stopping";
-  await registry.upsert({ ...child, status: "stopping" }).catch(() => {});
+  await registry.conditionalPatch(child.id, child.nonce, { expectedStop: true, status: "stopping" }).catch(() => {});
   eventReaders.get(key)?.abort();
   eventReaders.delete(key);
   const dispose = canHttp ? await client.post("/instance/dispose", undefined, { timeoutMs: options.disposeTimeoutMs ?? 1500, signal: options.signal }) : { ok: false, status: 0, error: "refusing to dispose non-loopback child URL" };
@@ -796,24 +920,38 @@ async function stopChildUnlocked(registry, child, options = {}, notifier) {
     await sleep(200);
     alive = isPidAlive(child.pid);
   }
-  let updated;
-  try {
-    updated = await registry.markStopped(child.id, { expectedStop: true, disposeResult: dispose, processAlive: alive, terminated, killed });
-  } catch {
-    // A registry write failure must not abort the temp-dir cleanup below or the
-    // result the caller relies on; fall back to a synthetic stopped record.
-    updated = { ...child, status: "stopped", expectedStop: true, processAlive: alive };
-  }
   if (!alive) notifier?.clearChildState?.(child.id);
   const cleanup = [];
+  const stopMessages = [];
   let stopOutcome = dispose.ok ? "disposed" : (alive ? "dispose_timeout_process_alive_cleanup_skipped" : (killed ? "dispose_timeout_killed" : "dispose_timeout_cleanup_succeeded"));
   // Only ever delete plugin-managed temp dirs (config/data/cache/state created via
   // mkdtemp), each behind the sandbox guard. A caller-supplied configDir is never in
   // managedDirs, so it can never be auto-deleted here.
-  if (alive) appendLog(child, "stderr", "\n[warning] process still alive; skipping managed-dir cleanup\n");
+  if (alive) stopMessages.push("\n[warning] process still alive; skipping managed-dir cleanup\n");
   if (options.cleanup !== false && child.cleanupPolicy === "delete-on-stop" && !alive) {
     const managed = child.managedDirs || child.spec?.managedDirs || [];
-    cleanup.push(...await cleanupManagedDirs(managed, { onSkip: (p, e) => appendLog(child, "stderr", `\n[cleanup skipped] ${p}: ${e.message}\n`) }));
+    cleanup.push(...await cleanupManagedDirs(managed, { onSkip: (p, e) => stopMessages.push(`\n[cleanup skipped] ${p}: ${e.message}\n`) }));
+  }
+  const current = await registry.get(child.id).catch(() => child);
+  const logCarrier = { auth: child.auth, logs: { ...(current.logs || child.logs || { stdout: "", stderr: "" }) } };
+  for (const message of stopMessages) appendLog(logCarrier, "stderr", message);
+  const stopFields = {
+    status: "stopped",
+    stoppedAt: nowIso(),
+    expectedStop: true,
+    disposeResult: dispose,
+    processAlive: alive,
+    terminated,
+    killed,
+    stopOutcome,
+    logs: logCarrier.logs,
+  };
+  let updated;
+  try {
+    const patch = await registry.conditionalPatch(child.id, child.nonce, stopFields, { allowedTerminalStatuses: ["stopping", "stopped", "failed"] });
+    updated = patch.child || { ...child, ...stopFields };
+  } catch {
+    updated = { ...child, ...stopFields };
   }
   return { id: child.id, stopped: !alive, dispose, terminated, killed, processAlive: alive, stopOutcome, cleanup, child: updated };
 }
@@ -838,16 +976,18 @@ export async function disposeLifecycleState(options = {}) {
   // Snapshot the keys and handles present at dispose entry BEFORE the async
   // terminate window below. We tear down exactly these snapshotted entries and no
   // others: a concurrently in-flight startChildUnlocked can register a fresh
-  // liveProcesses/eventReaders/lifecycleQueues entry (under a new key) while we
+  // liveProcesses/eventReaders entry (under a new key) while we
   // await terminateFn, and an unconditional .clear() here would silently wipe that
   // new handle — orphaning the just-spawned process (never in our terminate list)
   // and leaking its event-tail SSE loop with no controller left to abort it.
   const eventReaderSnapshot = [...eventReaders.entries()];
   const liveProcessSnapshot = [...liveProcesses.entries()];
+  const exitCompletionSnapshot = liveProcessSnapshot
+    .map(([, proc]) => processExitCompletions.get(proc))
+    .filter(Boolean);
   const snapshotKeys = new Set([
     ...eventReaderSnapshot.map(([key]) => key),
     ...liveProcessSnapshot.map(([key]) => key),
-    ...lifecycleQueues.keys(),
   ]);
   const controllers = eventReaderSnapshot.map(([, controller]) => controller);
   const pids = liveProcessSnapshot.map(([, proc]) => proc?.pid).filter(Boolean);
@@ -864,14 +1004,27 @@ export async function disposeLifecycleState(options = {}) {
       termination = { error: error?.message || String(error) };
     }
   }
+  let exitHandlers;
+  if (exitCompletionSnapshot.length) {
+    const timeoutMs = options.exitHandlerTimeoutMs ?? 2000;
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+      timer.unref?.();
+    });
+    const completed = Promise.allSettled(exitCompletionSnapshot).then(() => ({ timedOut: false }));
+    exitHandlers = await Promise.race([completed, timeout]);
+    clearTimeout(timer);
+    exitHandlers.count = exitCompletionSnapshot.length;
+    exitHandlers.timeoutMs = timeoutMs;
+  }
   // Delete only the keys we snapshotted at entry. Entries registered during the
   // await above survive and stay tracked/abortable by a later stop/dispose.
   for (const key of snapshotKeys) {
     eventReaders.delete(key);
     liveProcesses.delete(key);
-    lifecycleQueues.delete(key);
   }
-  return { abortedEventReaders: controllers.length, terminatedPids: pids.length, termination };
+  return { abortedEventReaders: controllers.length, terminatedPids: pids.length, termination, exitHandlers };
 }
 
 export async function eventsChild(registry, id, options = {}) {
@@ -909,4 +1062,4 @@ export function getLiveProcess(id) {
   return liveProcesses.get(id);
 }
 
-export const _test = { buildRestartSpec, handleProcExit, handleExitSignal, killAllSync, liveProcesses, eventReaders, lifecycleQueues, withChildLifecycle, resolveStartupTimeout, lifecycleKey, countLiveForRegistry, provisionStartValues, resolveCleanupPolicy, writeChildConfig };
+export const _test = { buildRestartSpec, cleanupWithDiagnostics, handleProcExit, handleExitSignal, killAllSync, liveProcesses, eventReaders, lifecycleQueues, startupQueues, processExitCompletions, trackProcessExit, withChildLifecycle, resolveStartupTimeout, lifecycleKey, countLiveForRegistry, provisionStartValues, resolveCleanupPolicy, writeChildConfig };

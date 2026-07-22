@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ChildRegistry, defaultStateDir } from "../src/registry.js";
@@ -147,7 +148,7 @@ test("the plugin exposes a dispose hook that tears down the module-level caches"
   });
 });
 
-test("notification manager pruning preserves managers for projects with active children", async () => {
+test("notification manager capacity refusal preserves managers for projects with active children", async () => {
   await withTempDir("opencode-child-index-xdg-", async (xdgRoot) => {
     await withTempDir("opencode-child-index-projects-", async (projectsRoot) => {
       const previousStateDir = process.env.OPENCODE_CHILD_STATE_DIR;
@@ -169,13 +170,20 @@ test("notification manager pruning preserves managers for projects with active c
           baseUrl: "http://127.0.0.1:1",
         });
 
-        for (let i = 0; i < 65; i += 1) {
+        for (let i = 0; i < 64; i += 1) {
           const projectDir = i === 0 ? activeProjectDir : path.join(projectsRoot, `project-${i}`);
           await assert.rejects(
             () => plugin.tool.oc_child_stop.execute({ childId: `missing_${i}` }, { directory: projectDir, sessionID: `parent_${i}` }),
             /unknown child/,
           );
         }
+
+        const refusedProjectDir = path.join(projectsRoot, "project-refused");
+        const refusedStateDir = defaultStateDir(refusedProjectDir);
+        await assert.rejects(
+          () => plugin.tool.oc_child_stop.execute({ childId: "missing_refused" }, { directory: refusedProjectDir, sessionID: "parent_refused" }),
+          (error) => error.message.includes("capacity 64") && error.message.includes(refusedStateDir),
+        );
 
         assert.equal(__hasNotificationManagerForTest(activeStateDir), true);
         assert.equal(__moduleStateSizes().notificationManagers, 64);
@@ -202,6 +210,35 @@ test("plugin dispose aborts lifecycle event readers and drops live process handl
       assert.equal(controller.aborted, true);
       assert.equal(lifecycleTest.eventReaders.size, 0);
       assert.equal(lifecycleTest.liveProcesses.size, 0);
+    });
+  });
+});
+
+test("plugin dispose retains notification managers until process-exit handling settles", async () => {
+  await withDiagnosticsRoot(async () => {
+    await withPluginContext(async ({ plugin, context, stateDir }) => {
+      await assert.rejects(
+        () => plugin.tool.oc_child_stop.execute({ childId: "child_missing_exit_wait" }, context),
+        /unknown child/,
+      );
+      const proc = new EventEmitter();
+      proc.pid = 2147483646;
+      let releaseExit;
+      let handlerSawManager;
+      lifecycleTest.liveProcesses.set("child_delayed_exit", proc);
+      lifecycleTest.trackProcessExit(proc, async () => {
+        await new Promise((resolve) => { releaseExit = resolve; });
+        handlerSawManager = __hasNotificationManagerForTest(stateDir);
+      });
+      proc.emit("exit", 0, null);
+
+      const disposing = plugin.dispose();
+      await Promise.resolve();
+      assert.equal(__hasNotificationManagerForTest(stateDir), true);
+      releaseExit();
+      await disposing;
+      assert.equal(handlerSawManager, true);
+      assert.equal(__hasNotificationManagerForTest(stateDir), false);
     });
   });
 });

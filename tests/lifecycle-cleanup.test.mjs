@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { ChildRegistry } from "../src/registry.js";
-import { stopChild, disposeLifecycleState, _test } from "../src/lifecycle.js";
+import { BulkStopError, stopChild, disposeLifecycleState, _test } from "../src/lifecycle.js";
 
 const exists = async (p) => { try { await stat(p); return true; } catch { return false; } };
 
@@ -119,6 +119,9 @@ test("stopChild does not signal registry-only live PIDs by default", async () =>
     assert.equal(result.processAlive, true);
     assert.equal(result.terminated, false);
     assert.equal(result.killed, false);
+    assert.match(result.child.logs.stderr, /process still alive; skipping managed-dir cleanup/);
+    const fresh = new ChildRegistry(stateDir);
+    assert.match((await fresh.get("child_stale_pid")).logs.stderr, /process still alive; skipping managed-dir cleanup/);
   } finally {
     await rm(stateDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -221,6 +224,131 @@ test("stopChild bulk all sends dispose requests concurrently", async () => {
   }
 });
 
+test("stopChild bulk reports mixed success without exposing raw child rows", async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), "oc-stop-bulk-mixed-"));
+  try {
+    const registry = new ChildRegistry(stateDir);
+    await registry.upsert({ id: "child_ok", pid: 2147483646, status: "ready", baseUrl: "http://192.0.2.1:9", cleanupPolicy: "keep", auth: { password: "must-not-leak" } });
+    await registry.upsert({ id: "child_bad", pid: 2147483646, status: "ready", baseUrl: "http://192.0.2.2:9", cleanupPolicy: "keep" });
+    const error = await stopChild(registry, "all", { graceMs: 0, termGraceMs: 0 }, {
+      markExpectedStop(id) { if (id === "child_bad") throw Object.assign(new Error("forced target failure"), { code: "E_TARGET" }); },
+      clearChildState() {},
+    }).then(() => undefined, (reason) => reason);
+
+    assert.ok(error instanceof BulkStopError);
+    assert.equal(error.code, "OPENCODE_CHILD_BULK_STOP_FAILED");
+    assert.equal(error.cancelled, false);
+    assert.deepEqual(error.summary, { total: 2, fulfilled: 1, rejected: 1 });
+    const fulfilled = error.outcomes.find((outcome) => outcome.status === "fulfilled");
+    const rejected = error.outcomes.find((outcome) => outcome.status === "rejected");
+    assert.equal(fulfilled.childId, "child_ok");
+    assert.equal(fulfilled.result.id, "child_ok");
+    assert.equal(fulfilled.result.child, undefined);
+    assert.equal(JSON.stringify(fulfilled).includes("must-not-leak"), false);
+    assert.equal(rejected.childId, "child_bad");
+    assert.equal(rejected.error.code, "E_TARGET");
+  } finally {
+    await rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("stopChild bulk reports total failure after every target settles", async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), "oc-stop-bulk-total-"));
+  try {
+    const registry = new ChildRegistry(stateDir);
+    await registry.upsert({ id: "child_fail_a", pid: 2147483646, status: "ready", baseUrl: "http://192.0.2.1:9" });
+    await registry.upsert({ id: "child_fail_b", pid: 2147483646, status: "ready", baseUrl: "http://192.0.2.2:9" });
+    const error = await stopChild(registry, "all", {}, { markExpectedStop() { throw new Error("all fail"); } }).catch((reason) => reason);
+    assert.ok(error instanceof BulkStopError);
+    assert.deepEqual(error.summary, { total: 2, fulfilled: 0, rejected: 2 });
+    assert.deepEqual(error.outcomes.map((outcome) => outcome.childId), ["child_fail_a", "child_fail_b"]);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("stopChild bulk classifies an abort after launch as cancellation", async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), "oc-stop-bulk-cancel-"));
+  let release;
+  try {
+    const registry = new ChildRegistry(stateDir);
+    await registry.upsert({ id: "child_cancel_fast", pid: 2147483646, status: "ready", baseUrl: "http://192.0.2.1:9" });
+    await registry.upsert({ id: "child_cancel_blocked", pid: 2147483646, status: "ready", baseUrl: "http://192.0.2.2:9" });
+    const blocker = _test.withChildLifecycle(_test.lifecycleKey(registry, "child_cancel_blocked"), () => new Promise((resolve) => { release = resolve; }));
+    await Promise.resolve();
+    const controller = new AbortController();
+    let fastSettled;
+    const fastDone = new Promise((resolve) => { fastSettled = resolve; });
+    const stopping = stopChild(registry, "all", { signal: controller.signal, graceMs: 0, termGraceMs: 0 }, {
+      markExpectedStop() {},
+      clearChildState(id) { if (id === "child_cancel_fast") fastSettled(); },
+    });
+    await fastDone;
+    controller.abort();
+    release();
+    const error = await stopping.catch((reason) => reason);
+    assert.ok(error instanceof BulkStopError);
+    assert.equal(error.code, "OPENCODE_CHILD_BULK_STOP_CANCELLED");
+    assert.equal(error.cancelled, true);
+    assert.deepEqual(error.summary, { total: 2, fulfilled: 1, rejected: 1 });
+    assert.equal(error.outcomes[0].childId, "child_cancel_fast");
+    assert.equal(error.outcomes[0].status, "fulfilled");
+    assert.equal(error.outcomes[1].childId, "child_cancel_blocked");
+    assert.equal(error.outcomes[1].status, "rejected");
+    await blocker;
+  } finally {
+    release?.();
+    await rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("BulkStopError bounds and redacts rejected messages", async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), "oc-stop-bulk-redact-"));
+  const secret = "very-secret-bulk-value";
+  try {
+    const registry = new ChildRegistry(stateDir);
+    await registry.upsert({ id: "child_secret_error", pid: 2147483646, status: "ready", baseUrl: "http://192.0.2.1:9" });
+    const raw = Object.assign(new Error(`token=${secret} ${"x".repeat(3000)}`), { code: 500 });
+    const error = await stopChild(registry, "all", {}, { markExpectedStop() { throw raw; } }).catch((reason) => reason);
+    assert.ok(error instanceof BulkStopError);
+    assert.ok(error.message.length <= 4000);
+    assert.ok(error.outcomes[0].error.message.length <= 1000);
+    assert.equal(error.outcomes[0].error.message.includes(secret), false);
+    assert.equal(error.outcomes[0].error.stack, undefined);
+    assert.equal(error.outcomes[0].error.cause, undefined);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("stopChild single-target failures remain raw errors", async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), "oc-stop-single-error-"));
+  try {
+    const registry = new ChildRegistry(stateDir);
+    await registry.upsert({ id: "child_single", pid: 2147483646, status: "ready", baseUrl: "http://192.0.2.1:9" });
+    const error = await stopChild(registry, "child_single", {}, { markExpectedStop() { throw new TypeError("single unchanged"); } }).catch((reason) => reason);
+    assert.ok(error instanceof TypeError);
+    assert.equal(error instanceof BulkStopError, false);
+    assert.equal(error.message, "single unchanged");
+  } finally {
+    await rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("stopChild persists managed-directory cleanup skip diagnostics", async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), "oc-stop-cleanup-skip-"));
+  try {
+    const registry = new ChildRegistry(stateDir);
+    await registry.upsert({ id: "child_cleanup_skip", nonce: "cleanup-nonce", pid: 2147483646, status: "ready", baseUrl: "http://192.0.2.1:9", cleanupPolicy: "delete-on-stop", managedDirs: [process.cwd()] });
+    const result = await stopChild(registry, "child_cleanup_skip", { graceMs: 0, termGraceMs: 0 });
+    assert.match(result.child.logs.stderr, /cleanup skipped/);
+    const fresh = new ChildRegistry(stateDir);
+    assert.match((await fresh.get("child_cleanup_skip")).logs.stderr, /cleanup skipped/);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 test("stopChild signals a registry-only live PID only when explicitly allowed", async () => {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), "oc-stop-allow-pid-state-"));
   const originalKill = process.kill;
@@ -275,7 +403,11 @@ test("disposeLifecycleState tears down only entries snapshotted at entry, preser
   const snapshotProc = { pid: 111111 };
   eventReaders.set("child_snapshot", snapshotController);
   liveProcesses.set("child_snapshot", snapshotProc);
-  lifecycleQueues.set("child_snapshot", Promise.resolve());
+  let releaseQueuedOperation;
+  const queuedOperation = _test.withChildLifecycle("child_snapshot", async () => {
+    await new Promise((resolve) => { releaseQueuedOperation = resolve; });
+  });
+  await Promise.resolve();
 
   // Handle for a start that lands DURING the async terminate window — its key was
   // never in the snapshot, so dispose must leave it tracked and abortable.
@@ -302,9 +434,19 @@ test("disposeLifecycleState tears down only entries snapshotted at entry, preser
     assert.equal(result.abortedEventReaders, 1);
     assert.equal(result.terminatedPids, 1);
 
-    // Snapshotted keys are gone from every map.
+    // Disposal owns process/reader cleanup, but not lifecycle queue cleanup.
     assert.equal(eventReaders.has("child_snapshot"), false);
     assert.equal(liveProcesses.has("child_snapshot"), false);
+    assert.equal(lifecycleQueues.has("child_snapshot"), true);
+
+    let chainedRan = false;
+    const chained = _test.withChildLifecycle("child_snapshot", async () => { chainedRan = true; });
+    await Promise.resolve();
+    assert.equal(chainedRan, false, "post-disposal operation must remain behind the pending queue owner");
+    releaseQueuedOperation();
+    await queuedOperation;
+    await chained;
+    assert.equal(chainedRan, true);
     assert.equal(lifecycleQueues.has("child_snapshot"), false);
 
     // The concurrently registered child survives — it was NOT wiped by a blanket
@@ -314,22 +456,25 @@ test("disposeLifecycleState tears down only entries snapshotted at entry, preser
     assert.equal(liveProcesses.get("child_concurrent"), concurrentProc);
     assert.equal(lifecycleQueues.has("child_concurrent"), true);
   } finally {
+    releaseQueuedOperation?.();
+    await queuedOperation.catch(() => {});
     eventReaders.clear();
     liveProcesses.clear();
     lifecycleQueues.clear();
   }
 });
 
-test("stopChild returns a synthetic stopped result when markStopped fails", async () => {
+test("stopChild returns a synthetic stopped result when the final conditional patch fails", async () => {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), "oc-stop-fallback-state-"));
   try {
-    class MarkStoppedFailingRegistry extends ChildRegistry {
-      async markStopped() {
-        throw new Error("forced markStopped failure");
+    class FinalPatchFailingRegistry extends ChildRegistry {
+      async conditionalPatch(id, nonce, fields, options) {
+        if (fields.status === "stopped") throw new Error("forced conditionalPatch failure");
+        return await super.conditionalPatch(id, nonce, fields, options);
       }
     }
 
-    const registry = new MarkStoppedFailingRegistry(stateDir);
+    const registry = new FinalPatchFailingRegistry(stateDir);
     await registry.upsert({ id: "child_mark_failed", pid: 2147483646, status: "ready", baseUrl: "http://192.0.2.1:9", cleanupPolicy: "keep" });
 
     const result = await stopChild(registry, "child_mark_failed", {

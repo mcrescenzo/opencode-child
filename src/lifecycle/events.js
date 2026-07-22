@@ -119,17 +119,38 @@ export async function startEventTail(registry, child, notifier, options = {}) {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let raw = "";
+    let discarding = false;
     while (!controller.signal.aborted) {
       const { done, value } = await reader.read();
       if (done) break;
       raw += decoder.decode(value, { stream: true });
-      if (raw.length > EVENT_BUFFER_LIMIT) raw = raw.slice(-EVENT_BUFFER_LIMIT);
+      if (discarding) {
+        // An oversized frame is being discarded. Wait for the next blank-line
+        // block boundary, then resume normal parsing after it.
+        const boundary = raw.indexOf("\n\n");
+        if (boundary === -1) {
+          raw = "";
+          continue;
+        }
+        raw = raw.slice(boundary + 2);
+        discarding = false;
+        if (!raw) continue;
+      }
+      // Split off complete blocks first; the tail is the unterminated frame.
       const blocks = raw.split("\n\n");
       raw = blocks.pop() || "";
       for (const block of blocks) {
         const event = parseSseBlock(block, secrets);
         await push(event);
         await notifier?.handleChildEvent(child, event).catch(() => {});
+      }
+      // If the unterminated tail exceeds the limit, the in-progress frame is
+      // oversized. Emit one bounded error marker and discard until the next
+      // block boundary so the misparsed frame cannot corrupt later valid frames.
+      if (raw.length > EVENT_BUFFER_LIMIT) {
+        await push({ type: "event.error", error: truncate("frame exceeded buffer limit; discarding until next block boundary", EVENT_TEXT_LIMIT) });
+        discarding = true;
+        raw = "";
       }
     }
     return true;

@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { ChildRegistry } from "../src/registry.js";
-import { collectStartRisks, startChild, _test } from "../src/lifecycle.js";
-import { isMetadataServiceHostname, safeEnv } from "../src/lifecycle/risk.js";
+import { collectStartRisks, disposeLifecycleState, startChild, _test } from "../src/lifecycle.js";
+import { isMetadataServiceHostname, safeEnv, validateStartPreflight } from "../src/lifecycle/risk.js";
+import { writeFakeOpencodeBin } from "./helpers/fake-opencode.mjs";
 
 const exists = async (p) => { try { await stat(p); return true; } catch { return false; } };
 
@@ -195,6 +196,15 @@ test("startChild rejects metadata-service hostnames with a specific error", asyn
   }
 });
 
+test("validateStartPreflight rejects malformed dotted-numeric hostnames before spawn or approval", () => {
+  assert.throws(() => validateStartPreflight({ hostname: "127.0.0.999" }, { hostname: "127.0.0.999" }), /invalid IPv4 hostname/);
+  assert.throws(() => validateStartPreflight({ hostname: "127.999.999.999" }, { hostname: "127.999.999.999" }), /invalid IPv4 hostname/);
+  // even with allowNonLoopback the malformed value is rejected outright
+  assert.throws(() => validateStartPreflight({ hostname: "127.0.0.999", allowNonLoopback: true }, { hostname: "127.0.0.999" }), /invalid IPv4 hostname/);
+  // a valid loopback address still passes
+  assert.doesNotThrow(() => validateStartPreflight({ hostname: "127.0.0.1" }, { hostname: "127.0.0.1" }));
+});
+
 test("startChild rejects inheritGlobalConfig=false outside safe mode with actionable guidance", async () => {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), "oc-start-state-"));
   try {
@@ -263,4 +273,89 @@ test("writeChildConfig creates the config dir with 0700 mode (not world-readable
   } finally {
     await rm(base, { recursive: true, force: true });
   }
+});
+
+test("failed-start cleanup diagnostics cover config, validation, insert, and retry paths", async (t) => {
+  const secret = "cleanup-secret-value";
+  const cleanupFailure = async (dirs) => {
+    await Promise.all((dirs || []).map((dir) => rm(dir, { recursive: true, force: true })));
+    return (dirs || []).map(() => ({ deleted: false, reason: `permission denied for /arbitrary/private/location token=${secret} ${"x".repeat(1500)}` }));
+  };
+  const assertCleanupError = (error) => {
+    assert.match(error.message, /cleanup incomplete: \d+ directories could not be removed/);
+    assert.equal(error.message.includes(secret), false);
+    assert.equal(error.message.includes("/arbitrary/private/location"), false);
+    assert.ok(error.message.length <= 4000);
+  };
+
+  await t.test("config-write failure", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oc-cleanup-config-write-"));
+    const configFile = path.join(root, "config-file");
+    await writeFile(configFile, "not a directory");
+    try {
+      const error = await startChild(new ChildRegistry(path.join(root, "state")), {
+        id: "cleanup_config_write",
+        configDir: configFile,
+        allowExternalDirs: true,
+        _parentApprovedRisks: ["external-dirs"],
+        _cleanupManagedDirs: cleanupFailure,
+      }, { directory: root }).catch((reason) => reason);
+      assertCleanupError(error);
+    } finally {
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  await t.test("validation failure", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oc-cleanup-validation-"));
+    try {
+      const stateDir = path.join(root, "state");
+      await mkdir(stateDir, { recursive: true });
+      const registry = new ChildRegistry(stateDir);
+      await registry.upsert({ id: "cleanup_duplicate", status: "ready" });
+      const error = await startChild(registry, { id: "cleanup_duplicate", _cleanupManagedDirs: cleanupFailure }, { directory: root }).catch((reason) => reason);
+      assertCleanupError(error);
+    } finally {
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  await t.test("registry-insert failure", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oc-cleanup-insert-"));
+    try {
+      const opencodeBin = await writeFakeOpencodeBin(root);
+      class FailingInsertRegistry extends ChildRegistry {
+        async insert() { throw new Error("forced registry insert failure"); }
+      }
+      const error = await startChild(new FailingInsertRegistry(path.join(root, "state")), {
+        id: "cleanup_insert",
+        opencodeBin,
+        _parentApprovedRisks: ["high-risk-start"],
+        _cleanupManagedDirs: cleanupFailure,
+      }, { directory: root }).catch((reason) => reason);
+      assertCleanupError(error);
+    } finally {
+      await disposeLifecycleState({ terminateOptions: { graceMs: 0 } }).catch(() => {});
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  await t.test("EADDRINUSE retry cleanup failure", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oc-cleanup-retry-"));
+    try {
+      const opencodeBin = await writeFakeOpencodeBin(root);
+      const error = await startChild(new ChildRegistry(path.join(root, "state")), {
+        id: "cleanup_retry",
+        opencodeBin,
+        env: { FAKE_OPENCODE_MODE: "eaddrinuse-once", FAKE_OPENCODE_MARKER: path.join(root, "marker") },
+        timeoutMs: 1000,
+        _parentApprovedRisks: ["high-risk-start"],
+        _cleanupManagedDirs: cleanupFailure,
+      }, { directory: root }).catch((reason) => reason);
+      assertCleanupError(error);
+    } finally {
+      await disposeLifecycleState({ terminateOptions: { graceMs: 0 } }).catch(() => {});
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
 });

@@ -163,7 +163,12 @@ export function publicRedact(value) {
 export function isLoopbackHostname(hostname = "") {
   const host = String(hostname || "").trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
   if (host === "localhost" || host === "::1") return true;
-  if (/^127(?:\.\d{1,3}){3}$/.test(host)) return true;
+  // Validate 127/8 IPv4 with proper octet bounds so malformed numeric hostnames
+  // (e.g. 127.0.0.999) are rejected rather than classified as loopback.
+  const parts = host.split(".");
+  if (parts.length === 4 && parts[0] === "127") {
+    return parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+  }
   return false;
 }
 

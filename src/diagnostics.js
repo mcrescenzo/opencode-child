@@ -29,7 +29,7 @@ function redactText(value) {
   let end = MAX_STRING;
   const last = text.charCodeAt(end - 1);
   if (last >= 0xd800 && last <= 0xdbff) end -= 1; // back off a lone high surrogate
-  return `${text.slice(0, end)}\n[truncated ${text.length - MAX_STRING} chars]`;
+    return `${text.slice(0, end)}\n[truncated ${text.length - end} chars]`;
 }
 
 function redactValue(value, seen = new WeakSet(), depth = 0) {

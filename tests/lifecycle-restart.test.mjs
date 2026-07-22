@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { ChildRegistry } from "../src/registry.js";
@@ -112,5 +112,64 @@ test("restartChild refuses to start a replacement when the previous child remain
   } finally {
     process.kill = originalKill;
     await rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("restartChild drops legacy redacted config and env instead of replaying placeholders", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "oc-restart-non-fidelity-"));
+  const stateDir = path.join(root, "state");
+  const projectDir = path.join(root, "project");
+  const configDir = path.join(root, "config");
+  const id = "child_restart_non_fidelity";
+  const secret = "super-secret-restart-token";
+  try {
+    const opencodeBin = await writeFakeOpencodeBin(root);
+    await mkdir(stateDir, { recursive: true });
+    await mkdir(projectDir, { recursive: true });
+    const registry = new ChildRegistry(stateDir);
+    await registry.upsert({
+      id,
+      nonce: "old-nonce",
+      pid: 2147483646,
+      status: "ready",
+      baseUrl: "http://192.0.2.1:9",
+      projectDir,
+      configDir,
+      managedDirs: [configDir],
+      inheritData: true,
+      cleanupPolicy: "keep",
+      trustMode: "inherit",
+      auth: { password: secret },
+      spec: {
+        id,
+        projectDir,
+        configDir,
+        managedDirs: [configDir],
+        inheritData: true,
+        cleanupPolicy: "keep",
+        trustMode: "inherit",
+        opencodeBin,
+        config: "[redacted]",
+        env: "[redacted]",
+      },
+    });
+
+    const result = await restartChild(registry, id, { timeoutMs: 3000 }, { directory: projectDir });
+    const generatedConfig = JSON.parse(await readFile(path.join(configDir, "opencode.json"), "utf8"));
+    assert.deepEqual(generatedConfig, { $schema: "https://opencode.ai/config.json" });
+    assert.match(result.child.logs.stderr, /restart non-fidelity.*custom config and custom environment overrides/);
+    assert.equal(result.child.spec.config, undefined);
+    assert.equal(result.child.spec.env, undefined);
+
+    const fresh = new ChildRegistry(stateDir);
+    const persisted = await fresh.get(id);
+    assert.match(persisted.logs.stderr, /restart non-fidelity.*intentionally dropped/);
+    const persistedText = await readFile(path.join(stateDir, "children.json"), "utf8");
+    assert.equal(persistedText.includes(secret), false);
+    assert.equal(persistedText.includes('"config":"[redacted]"'), false);
+    assert.equal(persistedText.includes('"env":"[redacted]"'), false);
+  } finally {
+    await disposeLifecycleState({ terminateOptions: { graceMs: 0 } }).catch(() => {});
+    await rm(root, { recursive: true, force: true }).catch(() => {});
   }
 });

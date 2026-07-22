@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { ChildRegistry } from "../src/registry.js";
@@ -18,6 +18,11 @@ const exists = async (p) => {
     return false;
   }
 };
+
+async function managedTempDirs() {
+  const prefixes = ["opencode-child-config-", "opencode-child-data-", "opencode-child-cache-", "opencode-child-state-"];
+  return new Set((await readdir(os.tmpdir())).filter((entry) => prefixes.some((prefix) => entry.startsWith(prefix))));
+}
 
 async function listenLoopback(server) {
   const listening = once(server, "listening");
@@ -201,6 +206,79 @@ test("startChild enforces the live-child concurrency cap before spawning", async
       _test.liveProcesses.delete(existingKey);
       process.kill = originalKill;
     }
+  });
+});
+
+test("startup serialization is scoped by registry stateDir", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "oc-start-queues-"));
+  const stateA = path.join(root, "state-a");
+  const stateB = path.join(root, "state-b");
+  await mkdir(stateA, { recursive: true });
+  await mkdir(stateB, { recursive: true });
+  const seedA = new ChildRegistry(stateA);
+  await seedA.upsert({ id: "slow", status: "ready", pid: 2147483646, baseUrl: "http://127.0.0.1:8" });
+  let releaseA;
+  let enteredA;
+  const entered = new Promise((resolve) => { enteredA = resolve; });
+  class SlowLoadRegistry extends ChildRegistry {
+    async load() {
+      enteredA();
+      await new Promise((resolve) => { releaseA = resolve; });
+      return await super.load();
+    }
+  }
+  const registryA = new SlowLoadRegistry(stateA);
+  const registryB = new ChildRegistry(stateB);
+  await registryB.upsert({ id: "duplicate", status: "ready", pid: 2147483646, baseUrl: "http://127.0.0.1:9" });
+  const first = startChild(registryA, { id: "slow" }, { directory: root });
+  try {
+    await entered;
+    await assert.rejects(
+      Promise.race([
+        startChild(registryB, { id: "duplicate" }, { directory: root }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("unrelated registry start was blocked")), 500)),
+      ]),
+      /child id already exists: duplicate/,
+    );
+  } finally {
+    releaseA?.();
+    await first.catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("provisionStartValues cleans attempt-owned directories when port allocation fails", async () => {
+  const before = await managedTempDirs();
+  const allocationError = new Error("forced allocator failure");
+  await assert.rejects(
+    () => _test.provisionStartValues({}, {}, { allocatePort: async () => { throw allocationError; } }),
+    (error) => error === allocationError,
+  );
+  assert.deepEqual(await managedTempDirs(), before);
+});
+
+test("duplicate active child validation cleans directories created by the rejected attempt", async () => {
+  await withStartupFixture(async ({ projectDir, registry, opencodeBin }) => {
+    const args = {
+      id: "child_duplicate_cleanup",
+      opencodeBin,
+      timeoutMs: 3000,
+      _parentApprovedRisks: ["high-risk-start"],
+    };
+    const child = await startChild(registry, args, { directory: projectDir });
+    const before = await managedTempDirs();
+
+    await assert.rejects(() => startChild(registry, args, { directory: projectDir }), /child id already exists/);
+    assert.deepEqual(await managedTempDirs(), before);
+
+    await stopChild(registry, child.id, {
+      cleanup: true,
+      includeStale: true,
+      allowRegistryPidSignal: true,
+      graceMs: 0,
+      termGraceMs: 0,
+      disposeTimeoutMs: 500,
+    });
   });
 });
 

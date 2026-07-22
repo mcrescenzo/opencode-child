@@ -19,12 +19,11 @@ import { createChildDiagnostics } from "./diagnostics.js";
 // must be the single source of truth AND bounded: a long-lived parent that
 // drives children across distinct project directories/worktrees would otherwise
 // grow these Maps without limit. Registry entries are LRU-capped directly.
-// Notification managers are capacity-pruned only when their registry has no
-// non-terminal child rows, because evicting one tears down childOwners/watches/
-// pending bookkeeping. The `dispose` hook clears both caches on shutdown.
+// Notification managers retain live bookkeeping and therefore use strict
+// admission refusal rather than eviction. The `dispose` hook clears both caches.
 // ChildRegistry entries are pure in-memory caches over the on-disk children.json,
 // so dropping one only forces a reload — no state is lost.
-const MAX_TRACKED_PROJECTS = 64;
+export const MAX_TRACKED_PROJECTS = 64;
 const RESULT_OUTPUT_MAX = 20000;
 export const MAX_TOOL_ARG_STRING_CHARS = 65536;
 export const MAX_TOOL_ARG_JSON_CHARS = 262144;
@@ -80,59 +79,73 @@ export function createBoundedMap(limit, onEvict) {
 }
 
 const registries = createBoundedMap(MAX_TRACKED_PROJECTS);
-const notificationManagers = createBoundedMap(Number.POSITIVE_INFINITY, (manager) => manager?.dispose?.());
+const notificationManagers = createBoundedMap(MAX_TRACKED_PROJECTS);
+const registryGenerations = new WeakMap();
+const managerRegistryGenerations = new WeakMap();
+let nextRegistryGeneration = 0;
+let disposing = false;
+let disposalPromise;
 
 function registryFor(context) {
   const stateDir = defaultStateDir(context?.directory || process.cwd());
   let registry = registries.get(stateDir);
   if (!registry) {
     registry = new ChildRegistry(stateDir);
+    registryGenerations.set(registry, ++nextRegistryGeneration);
     registries.set(stateDir, registry);
   }
   return registry;
 }
 
-function activeChildRow(child) {
-  return child && !child.expectedStop && !TERMINAL_STATUSES.has(child.status);
-}
-
-async function managerHasActiveChildren(manager) {
-  const children = await manager?.registry?.list?.();
-  return Array.isArray(children) && children.some(activeChildRow);
-}
-
-async function pruneNotificationManagers(protectedStateDir) {
-  while (notificationManagers.size > MAX_TRACKED_PROJECTS) {
-    let evicted = false;
-    for (const [stateDir, manager] of notificationManagers.entries()) {
-      if (stateDir === protectedStateDir) continue;
-      const active = await managerHasActiveChildren(manager).catch(() => true);
-      if (active) continue;
-      notificationManagers.delete(stateDir);
-      manager?.dispose?.();
-      evicted = true;
-      break;
-    }
-    if (!evicted) break;
-  }
-}
-
 async function notificationManagerFor(registry, pluginContext) {
   let manager = notificationManagers.get(registry.stateDir);
-  if (!manager) {
-    manager = new NotificationManager(pluginContext, registry);
-    notificationManagers.set(registry.stateDir, manager);
-    await pruneNotificationManagers(registry.stateDir);
+  const incomingGeneration = registryGenerations.get(registry) ?? 0;
+  if (manager) {
+    if (incomingGeneration > (managerRegistryGenerations.get(manager) ?? 0)) {
+      manager.registry = registry;
+      managerRegistryGenerations.set(manager, incomingGeneration);
+    }
+    return manager;
   }
+
+  if (disposing) throw new Error(`notification manager admission refused while disposing: ${registry.stateDir}`);
+  if (notificationManagers.size >= MAX_TRACKED_PROJECTS) {
+    throw new Error(`notification manager capacity ${MAX_TRACKED_PROJECTS} reached; refused stateDir: ${registry.stateDir}`);
+  }
+
+  manager = new NotificationManager(pluginContext, registry);
+  managerRegistryGenerations.set(manager, incomingGeneration);
+  notificationManagers.set(registry.stateDir, manager);
   return manager;
 }
 
 // Tear down every live lifecycle resource, cached NotificationManager, and
 // registry cache. Shared by the `dispose` hook; size accessor below is tests only.
-async function disposeModuleState() {
-  await disposeLifecycleState();
-  notificationManagers.clear(true);
-  registries.clear();
+function disposeModuleState() {
+  if (disposalPromise) return disposalPromise;
+  disposing = true;
+  disposalPromise = (async () => {
+    const errors = [];
+    try {
+      await disposeLifecycleState();
+    } catch (error) {
+      errors.push(error);
+    }
+    for (const manager of [...notificationManagers.values()]) {
+      try {
+        await manager.dispose();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    notificationManagers.clear();
+    registries.clear();
+    if (errors.length) throw new AggregateError(errors, "failed to dispose opencode-child module state");
+  })().finally(() => {
+    disposing = false;
+    disposalPromise = undefined;
+  });
+  return disposalPromise;
 }
 
 // Test-only introspection of the module-level caches. Not used by the plugin
@@ -145,6 +158,16 @@ export function __moduleStateSizes() {
 export function __hasNotificationManagerForTest(stateDir) {
   return notificationManagers.has(stateDir);
 }
+
+export const __notificationManagerTest = {
+  registryFor,
+  notificationManagerFor,
+  managerFor: (stateDir) => notificationManagers.get(stateDir),
+  registryGeneration: (registry) => registryGenerations.get(registry),
+  managerRegistryGeneration: (manager) => managerRegistryGenerations.get(manager),
+  isDisposing: () => disposing,
+  disposeModuleState,
+};
 
 function boundMetadata(value, seen = new WeakSet(), depth = 0) {
   if (typeof value === "string") return truncate(value, METADATA_MAX_STRING);
@@ -355,8 +378,8 @@ async function withDiagnostics(context, spec, fn) {
       level: "error",
       event: spec.failureEvent,
       message: spec.failureMessage,
-      sessionID: typeof spec.sessionID === "function" ? undefined : spec.sessionID,
-      childID: typeof spec.childID === "function" ? spec.childID(undefined) : spec.childID,
+      sessionID: resolveSpecField(spec.sessionID, undefined),
+      childID: resolveSpecField(spec.childID, undefined),
       tool: spec.tool,
       operation: spec.operation,
       outcome: "failure",
@@ -468,7 +491,7 @@ export function createOpenCodeChildPlugin(tool) {
           }),
         }),
         oc_child_restart: tool({
-          description: "Restart a child OpenCode process with its saved spec and refreshed startup inspection.",
+          description: "Restart a child OpenCode process from its saved non-secret identity and refreshed startup inspection. Prior custom config and environment overrides are intentionally not reproduced; supply new values explicitly where supported.",
           args: { childId: s.string(), port: s.number().int().positive().optional(), timeoutMs: timeoutMs() },
           execute: boundedExecute("oc_child_restart", async (args, context) => {
             const registry = registryFor(context);

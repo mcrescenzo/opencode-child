@@ -23,6 +23,25 @@ test("registry persists child metadata", async () => {
   }
 });
 
+test("conditionalPatch preserves terminal metadata and same-id replacement rows", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "opencode-child-registry-patch-test-"));
+  try {
+    const registry = new ChildRegistry(dir);
+    await registry.upsert({ id: "child_patch", nonce: "OLD", pid: 1, status: "ready", baseUrl: "http://127.0.0.1:1" });
+    await registry.markStopped("child_patch", { marker: "fresh-stop" });
+    const terminal = await registry.conditionalPatch("child_patch", "OLD", { status: "exited", marker: "stale-exit" });
+    assert.equal(terminal.applied, false);
+    assert.equal((await registry.get("child_patch")).marker, "fresh-stop");
+
+    await registry.insert({ id: "child_patch", nonce: "NEW", pid: 2, status: "ready", baseUrl: "http://127.0.0.1:2", marker: "replacement" }, { allowExistingTerminal: true });
+    const replacement = await registry.conditionalPatch("child_patch", "OLD", { status: "exited", marker: "stale-exit" });
+    assert.equal(replacement.applied, false);
+    assert.equal((await registry.get("child_patch")).marker, "replacement");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("registry scrubs persisted child secrets and startup inspection samples", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "opencode-child-registry-redaction-test-"));
   try {
