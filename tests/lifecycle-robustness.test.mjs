@@ -296,12 +296,17 @@ test("disposeLifecycleState is a no-op when no live process or event reader exis
 
 test("disposeLifecycleState bounds waiting for an exit handler that never settles", async () => {
   const proc = { pid: 2147483646 };
+  let resolveStuck;
+  const stuckPromise = new Promise((resolve) => { resolveStuck = resolve; });
   _test.liveProcesses.set("child_stuck_exit", proc);
-  _test.processExitCompletions.set(proc, new Promise(() => {}));
+  _test.processExitCompletions.set(proc, stuckPromise);
   try {
     const result = await disposeLifecycleState({ terminate: false, exitHandlerTimeoutMs: 10 });
     assert.deepEqual(result.exitHandlers, { timedOut: true, count: 1, timeoutMs: 10 });
   } finally {
+    // Resolve the stuck promise so the background allSettled inside
+    // disposeLifecycleState can settle instead of dangling forever.
+    resolveStuck();
     _test.liveProcesses.delete("child_stuck_exit");
     _test.processExitCompletions.delete(proc);
   }
